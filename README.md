@@ -4,6 +4,11 @@
 逐段拆分、同范围核对，生成物业与站方可以逐段对账的月度账单。系统**不接真实电表、不发起扣款**，
 只做数据核对、账单计算与依据留痕。
 
+在此基础上提供**分成合同变更的追溯试算**：物业提出保底费用、阶梯分成或优惠期延期时，财务把
+固定费用、分段比例、保底额、抵扣项、优惠期与生效范围保存为**可计算的结构化规则（非执行代码）**，
+对指定账单版本按「分段收益 → 允许抵扣 → 保底比较」的固定顺序重算历史月份，新旧条款并排展示逐项
+差异，并按指定期间批准差额；未批准的试算不进入应付统计，已确认结算的原始依据始终保留。
+
 ## 一、业务规则与实现位置
 
 | 规则（题目要求） | 实现方式 |
@@ -20,6 +25,16 @@
 | 确认前检查新修订；已确认账单只做差额更正 | `billing.check_new_revisions`（含 blocked 修订）阻止确认；`bill_adjustments` 保留原值、以 delta 更正，不替换原字段 |
 | 物业只能处理分配给自己的核对事项 | JWT 角色 + `user_sites` 授权范围，后端每个接口强制校验（`deps.py`） |
 | 金额小数精度 | 金额按 4 位小数 `ROUND_HALF_UP` 计算（展示 2 位），电量 4 位；拆分尾差并入末段保证合计守恒 |
+| 条款只能是可计算规则，不能写任意代码 | `revenue_contracts.rules_json` 只保存固定字段（fixed_fee/revenue_tiers/minimum_fee/deductions/promo_periods/priority），`contract_svc.validate_rules` 递归拒绝函数等非基础类型与未知字段；引擎仅解释这些字段，全流程无 eval/exec |
+| 固定运算顺序：分段收益→抵扣→保底 | `contract_svc.evaluate_month` 先按阶梯比例计分段收益，再扣允许抵扣（按生效天数折算），最后与保底取大；过程逐项写入 trial line 的 detail |
+| 保底与优惠冲突且未写优先级→停在待澄清 | 同月保底与优惠期互相覆盖且 `priority` 为空时，该月 `needs_clarification`，试算整体不可批准，程序不猜测对谁更有利；写明 minimum_first/promo_first 才自动判定 |
+| 不重算覆盖已确认结算，改为新旧并排+按期间批准 | 不回写账单；`contract_trials` 保存新旧规则快照与逐月并排差异，`contract_approvals` 只对指定期间批准差额；保留多版条款（draft/active/superseded）与批准范围 |
+| 签署时间不等于实际生效时间 | `signed_at` 与 `effective_date` 分列；运算只按实际生效范围裁剪天数 |
+| 草稿可反复编辑，审批只接受与当前草稿一致的试算 | 试算保存 `candidate_rules_hash`；草稿再编辑使哈希失配→试算 `stale`（数字保留可查看，失去批准资格），需重新发起 |
+| 日→月舍入尾差单列，不摊到订单 | 月度金额按月度合计一次性舍入，并把「月度舍入值−逐日先舍入合计」作为 `rounding_diff` 单独列出 |
+| 审批期间电量更正→相关月份重算、原试算失效但可查 | `classify_trial` 检测同号新修订（blocked_adopted）或同月新账单版本→`invalidated`，原试算仍可查看但不可批准 |
+| 两份方案覆盖相同账期须先确定采用关系 | 未声明 `supersedes_trial_id` 时试算 `blocked_overlap` 拒绝批准；声明后旧方案置 `superseded`，新方案方可批准 |
+| 未批准试算不进应付统计 | `bill_contract_view`/`site_payable_stats` 只汇总 status=approved 的差额；账单可分别查原合同结果、新条款结果、实际批准调整额三数 |
 
 ## 二、目录结构
 
@@ -31,15 +46,15 @@
 │   ├── requirements.txt
 │   ├── app/
 │   │   ├── main.py             # FastAPI 入口（启动自动建表，/docs Swagger UI）
-│   │   ├── models.py           # 原件索引/修订/计算依据/结算修订 四层表
-│   │   ├── importer 服务 / reconciliation 引擎 / tariff / billing / security / deps
-│   │   ├── routers/            # auth sites imports jobs bills tasks conflicts source-records entities
-│   │   └── seed.py             # 账号、站点、样例数据幂等播种
+│   │   ├── models.py           # 原件索引/修订/计算依据/结算修订/分成合同·试算·审批 分层表
+│   │   ├── importer 服务 / reconciliation 引擎 / tariff / billing / contract_svc（合同试算）/ security / deps
+│   │   ├── routers/            # auth sites imports jobs bills tasks conflicts source-records entities contracts
+│   │   └── seed.py             # 账号、站点、样例数据与分成合同（每站点现行 v1+变更草稿 v2）幂等播种
 │   ├── sample_data/            # 两站点样例 CSV（含生成器 generate_samples.py）
-│   └── tests/                  # pytest 19 个用例
+│   └── tests/                  # pytest 34 个用例（含 test_contracts.py 15 个合同试算用例）
 └── frontend/
     ├── Dockerfile + nginx.conf # 静态构建 + SPA/API 反代
-    └── src/pages/              # 登录、账单下钻、作业、导入、核对事项、冲突、实体查询
+    └── src/pages/              # 登录、账单下钻、作业、导入、核对事项、冲突、实体查询、分成合同/试算
 ```
 
 ## 三、一键启动（Docker Compose）
@@ -94,20 +109,38 @@ cd frontend
   完全同时段重复订单只计一次；部分重叠订单冲突（运营确认前均不计）；无任何依据订单→待补；
   公共负荷未确认→物业核对事项、不计入；未解释差额 250kWh（7.81% > 2% 阈值）→账单挂起不可确认。
 
+**分成合同种子（每站点现行 v1 + 变更草稿 v2，签署时间均早于实际生效日）：**
+
+- **S01 `RC-SH-01`**：v1 现行（固定费 1000、保底 2000、三段阶梯 20%/15%/10%、运维抵扣 300）；
+  v2 草稿提高保底到 2500、下调比例并新增 10/1–10/15 优惠期但**未写优先级**，对 10 月试算会停在
+  `needs_clarification`，演示“程序不猜测对谁更有利”。
+- **S02 `RC-XJ-01`**：v1 现行（固定费 800、保底 1500、两段 25%/18%）；v2 草稿含 10/10–10/20 优惠期且
+  **明确 `minimum_first`**，试算可直接进入批准流程，用于演示并排差异、按期间批准与账单三数视图。
+
 ## 七、验证方式与实际验证结论
 
 以下均为在本隔离环境**实际执行过**的验证（2026-11-13）：
 
 1. **后端单元/规则测试**：`cd backend && PYTHONPATH=. .venv/bin/python -m pytest tests -q`
-   → **19 passed**。覆盖：原件行号留存、同号重复、修订生效、采用后 blocked 不覆盖、时区边界实测拆分、
+   → **34 passed**。覆盖：原件行号留存、同号重复、修订生效、采用后 blocked 不覆盖、时区边界实测拆分、
    估算/待补标注、回退挂起不负电量、换表桥接、重复/冲突订单、未解释差额与阈值挂起、重跑输入冻结、
-   重跑不受作业后新电价影响、金额精度与合计守恒、物业站点隔离、确认前修订拦截、差额更正原值保留、冲突处理。
+   重跑不受作业后新电价影响、金额精度与合计守恒、物业站点隔离、确认前修订拦截、差额更正原值保留、冲突处理；
+   以及合同试算 15 项：结构化规则拒绝代码、候选必须是草稿、三段式运算顺序、阶梯分段、舍入尾差单列、
+   保底/优惠无优先级待澄清且禁止批准、写明优先级可批准与账单三数视图、草稿再编辑 stale 仍可查看、
+   电量更正 invalidated、同月新账单版本 invalidated、重叠账期须声明采用关系、未批准试算不进应付统计、
+   生效接替与签署/生效时间分列、物业只读与站点隔离、运营只读、静态 /trials 路由不被参数化合同 id 捕获。
 2. **HTTP 端到端冒烟**（真实 uvicorn 进程 + curl）：登录四角色 → 发起两站点核算（S01 completed / S02 suspended）
    → 账单下钻（4 区间、11 拆分段）→ 挂起账单确认返回 409 → S01 账单确认成功 → 差额更正保留原值
    （delta=-4.9999，原字段不变）→ 乌鲁木齐物业回复核对事项 → 上海物业跨站回复返回 403
    → 运营解决订单冲突 → 来源记录修订链 `[(1, applied), (2, applied)]`，全部通过。
+   合同试算专项冒烟另验证：物业写操作 403 且只见授权站点、非法规则 400、S01 保底+优惠无优先级试算
+   `needs_clarification` 且批准 409、S02 明确保底优先试算可批准（差额 300）、账单三数视图
+   （原合同 1500 / 新条款 1800 / 批准调整 300 / 生效应付 1800）、未批准时调整额为 0、草稿再编辑后试算
+   `stale` 数字仍可查、第二套同账期方案 `blocked_overlap`→声明采用关系后批准且旧试算置 `superseded`。
 3. **前端**：`npm run build` TypeScript 类型检查与生产构建成功；Vite dev 启动后首页 200、
-   `/api` 代理登录与 health 验证通过。
+   `/api` 代理登录与 health 验证通过。新增「分成合同/试算」页：合同版本列表、结构化规则编辑器
+   （仅固定字段、无代码入口）、试算发起、逐月新旧并排差异（含尾差/待澄清/失效提示）、按期间审批
+   与重叠采用关系、账单三数视图与站点应付统计。
 4. **Docker**：本隔离容器未安装 docker 守护进程，`Dockerfile`/`docker-compose.yml` 已交付但**未在此环境实际构建运行**；
    配置依据上述已验证的本地启动步骤编写，启动命令与端口见第三节。
 
@@ -122,6 +155,12 @@ cd frontend
 - `GET /api/conflicts`、`POST /api/conflicts/{id}/resolve` 订单冲突
 - `GET /api/source-records`、`/{id}/revisions` 来源记录与修订链
 - `GET /api/entities/readings|orders|public-loads|replacements` 原始依据查询
+- 分成合同与追溯试算（`/api/contracts`，财务可写、运营/物业只读并受站点隔离）：
+  - `GET /api/contracts`、`POST` 建草稿、`GET /{id}`、`PATCH /{id}` 编辑草稿、`POST /{id}/activate` 生效接替
+  - `POST /api/contracts/trials` 发起试算（固定输入）、`GET /api/contracts/trials`、`GET /trials/{id}`、
+    `POST /trials/{id}/refresh` 重新校验输入、`POST /trials/{id}/approve|reject`、`GET /trials/{id}/approvals`
+  - `GET /api/contracts/bills/{bill_id}/view` 账单三数视图（原合同/新条款/实际批准调整/生效应付）
+  - `GET /api/contracts/sites/{site_id}/payable-stats` 站点应付统计（未批准试算不计入）
 
 ## 九、CSV 列格式
 

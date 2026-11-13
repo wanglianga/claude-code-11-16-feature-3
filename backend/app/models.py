@@ -54,6 +54,29 @@ TASK_RESOLVED = "resolved"
 CONFLICT_OPEN = "open"
 CONFLICT_RESOLVED = "resolved"
 
+# ---- 分成合同版本状态 ----
+CONTRACT_DRAFT = "draft"            # 草稿：可反复编辑，不参与结算
+CONTRACT_ACTIVE = "active"          # 已生效：作为后续账单的现行规则
+CONTRACT_SUPERSEDED = "superseded"  # 被新版本接替，历史试算/审批仍指向本版本
+CONTRACT_ARCHIVED = "archived"      # 停用且无新版本接替
+
+# ---- 追溯试算状态 ----
+TRIAL_CALCULATED = "calculated"    # 试算完成且与当前草稿一致，可提交审批
+TRIAL_STALE = "stale"              # 草稿在试算后再次编辑，输入已变，失去批准资格（仍可查看）
+TRIAL_NEEDS_CLARIFICATION = "needs_clarification"  # 保底与优惠冲突且未声明优先级，停在待澄清
+TRIAL_INVALIDATED = "invalidated"  # 审批期间电量更正，相关月份重算，原试算可查看但不可批准
+TRIAL_APPROVED = "approved"        # 已在指定期间批准差额
+TRIAL_REJECTED = "rejected"        # 审批驳回（留痕，仍可查看）
+TRIAL_BLOCKED_OVERLAP = "blocked_overlap"  # 与已批准方案覆盖相同账期且采用关系未确定
+TRIAL_SUPERSEDED = "superseded"            # 批准了覆盖相同账期的新方案，本试算留痕不再有效
+
+# ---- 试算行结果状态 ----
+LINE_CLARIFY = "needs_clarification"
+
+# ---- 合同审批（按指定期间批准差额） ----
+APPROVAL_APPROVED = "approved"
+APPROVAL_REJECTED = "rejected"
+
 
 class Site(Base):
     __tablename__ = "sites"
@@ -401,4 +424,130 @@ class ReviewTask(Base):
     response: Mapped[str | None] = mapped_column(Text, nullable=True)
     responded_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
     responded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+# ============================ 分成合同变更与追溯试算 ============================
+
+class RevenueContract(Base):
+    """分成合同的一个版本。
+
+    条款只能保存为结构化规则（rules_json），由固定字段表达：
+    固定费用、分段（阶梯）比例、保底额、允许抵扣项、优惠期、生效范围、优先级。
+    规则不是可执行代码，试算引擎只解释这些固定字段，无法表达任意逻辑。
+    签署时间（signed_at）与实际生效时间（effective_date）分别记录，不得互相代替。
+    """
+    __tablename__ = "revenue_contracts"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), index=True)
+    contract_no: Mapped[str] = mapped_column(String(64), index=True)
+    version_no: Mapped[int] = mapped_column(Integer, default=1)
+    name: Mapped[str] = mapped_column(String(128))
+    status: Mapped[str] = mapped_column(String(16), default=CONTRACT_DRAFT, index=True)
+    # 结构化规则（不可执行），结构见 services/contract_svc.py 的 RULE_SPEC
+    rules_json: Mapped[str] = mapped_column(Text)
+    rules_hash: Mapped[str] = mapped_column(String(64))
+    # 生效范围（站点本地日期，闭区间）；签署时间仅作留痕
+    effective_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    end_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    signed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    superseded_by_id: Mapped[int | None] = mapped_column(
+        ForeignKey("revenue_contracts.id"), nullable=True
+    )
+    created_by: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow,
+                                                 onupdate=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("contract_no", "version_no"),)
+
+
+class ContractTrial(Base):
+    """一次追溯试算：固定输入（账单版本 + 新旧规则快照），结果不可变、可复算。
+
+    草稿在试算后再编辑会使本试算变 stale；审批期间电量更正会使相关月份 invalidated。
+    两种情况下原试算仍可查看，但都失去批准资格。
+    """
+    __tablename__ = "contract_trials"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), index=True)
+    trial_no: Mapped[str] = mapped_column(String(64), unique=True)
+    baseline_contract_id: Mapped[int] = mapped_column(ForeignKey("revenue_contracts.id"))
+    candidate_contract_id: Mapped[int] = mapped_column(ForeignKey("revenue_contracts.id"))
+    # 试算发起时刻的规则快照与哈希；审批只接受与当前草稿一致（hash 仍匹配）的试算
+    baseline_rules_json: Mapped[str] = mapped_column(Text)
+    candidate_rules_json: Mapped[str] = mapped_column(Text)
+    candidate_rules_hash: Mapped[str] = mapped_column(String(64), index=True)
+    # 指定试算期间（站点本地年月，YYYY-MM-01）
+    period_start: Mapped[date] = mapped_column(Date)
+    period_end: Mapped[date] = mapped_column(Date)
+    status: Mapped[str] = mapped_column(String(24), default=TRIAL_CALCULATED, index=True)
+    # 失效/失配原因留痕
+    status_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 输入快照：所用账单及每个账单的依据修订集合（JSON），保证固定输入可核对
+    bill_snapshot_json: Mapped[str] = mapped_column(Text)
+    created_by: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    lines: Mapped[list["ContractTrialLine"]] = relationship(
+        back_populates="trial", cascade="all, delete-orphan",
+        order_by="ContractTrialLine.period_month",
+    )
+
+
+class ContractTrialLine(Base):
+    """试算的逐月结果：原合同结果、新条款结果、差额，以及逐项运算过程与尾差。"""
+    __tablename__ = "contract_trial_lines"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    trial_id: Mapped[int] = mapped_column(ForeignKey("contract_trials.id"), index=True)
+    bill_id: Mapped[int | None] = mapped_column(ForeignKey("bills.id"), nullable=True)
+    period_month: Mapped[str] = mapped_column(String(7), index=True)  # YYYY-MM（站点本地）
+    line_status: Mapped[str] = mapped_column(String(24), default=TRIAL_CALCULATED)
+    clarify_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 分段收益（先计）
+    base_revenue: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=Decimal("0"))
+    cand_revenue: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=Decimal("0"))
+    # 允许抵扣（再扣）
+    base_deduction: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=Decimal("0"))
+    cand_deduction: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=Decimal("0"))
+    # 保底比较（最后）
+    base_minimum: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=Decimal("0"))
+    cand_minimum: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=Decimal("0"))
+    base_minimum_applied: Mapped[bool] = mapped_column(Boolean, default=False)
+    cand_minimum_applied: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 固定费用与优惠期标记
+    base_fixed_fee: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=Decimal("0"))
+    cand_fixed_fee: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=Decimal("0"))
+    base_in_promo: Mapped[bool] = mapped_column(Boolean, default=False)
+    cand_in_promo: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 应付（运算顺序完成后的结果）与差额
+    base_payable: Mapped[Decimal] = mapped_column(Numeric(14, 4))
+    cand_payable: Mapped[Decimal] = mapped_column(Numeric(14, 4))
+    delta: Mapped[Decimal] = mapped_column(Numeric(14, 4))
+    # 日级金额汇总到月度的舍入尾差（单独列出，不重复摊到每笔订单）
+    base_rounding_diff: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=Decimal("0"))
+    cand_rounding_diff: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=Decimal("0"))
+    # 逐项过程明细（分段/抵扣/保底/优惠的日级与月级数字，JSON）
+    detail_json: Mapped[str] = mapped_column(Text)
+    trial: Mapped[ContractTrial] = relationship(back_populates="lines")
+
+
+class ContractApproval(Base):
+    """对试算按指定期间批准差额；未批准的试算不进入应付统计。
+
+    两份追溯方案覆盖相同账期时，必须先确定采用关系（supersedes_trial_id），
+    否则试算停在 blocked_overlap，不能批准。
+    """
+    __tablename__ = "contract_approvals"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    trial_id: Mapped[int] = mapped_column(ForeignKey("contract_trials.id"), index=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), index=True)
+    decision: Mapped[str] = mapped_column(String(16), default=APPROVAL_APPROVED)
+    period_start: Mapped[date] = mapped_column(Date)
+    period_end: Mapped[date] = mapped_column(Date)
+    approved_delta: Mapped[Decimal] = mapped_column(Numeric(14, 4))
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 采用关系：本批准替代哪一份已批准/待批方案（覆盖相同账期时必填）
+    supersedes_trial_id: Mapped[int | None] = mapped_column(
+        ForeignKey("contract_trials.id"), nullable=True
+    )
+    approved_by: Mapped[str] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

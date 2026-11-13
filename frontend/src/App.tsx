@@ -7,6 +7,7 @@ import ImportsPage from "./pages/ImportsPage";
 import TasksPage from "./pages/TasksPage";
 import ConflictsPage from "./pages/ConflictsPage";
 import EntitiesPage from "./pages/EntitiesPage";
+import ContractsPage from "./pages/ContractsPage";
 
 const ROLE_LABEL: Record<string, string> = {
   finance: "平台财务",
@@ -22,6 +23,7 @@ function Shell() {
     { to: "/imports", label: "原件与导入", roles: ["finance", "operator", "property"] },
     { to: "/tasks", label: "核对事项", roles: ["finance", "operator", "property"] },
     { to: "/conflicts", label: "订单冲突", roles: ["finance", "operator"] },
+    { to: "/contracts", label: "分成合同/试算", roles: ["finance", "operator", "property"] },
     { to: "/entities", label: "读数/订单查询", roles: ["finance", "operator", "property"] },
   ].filter((n) => n.roles.includes(role));
 
@@ -51,6 +53,7 @@ function Shell() {
           <Route path="/imports" element={<ImportsPage />} />
           <Route path="/tasks" element={<TasksPage />} />
           <Route path="/conflicts" element={<ConflictsPage />} />
+          <Route path="/contracts" element={<ContractsPage />} />
           <Route path="/entities" element={<EntitiesPage />} />
           <Route path="*" element={<Navigate to="/bills" replace />} />
         </Routes>

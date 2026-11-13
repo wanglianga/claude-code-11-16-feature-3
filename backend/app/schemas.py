@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 
 class ORMModel(BaseModel):
@@ -192,3 +192,155 @@ class SourceRecordOut(ORMModel):
     source_record_no: str
     current_revision_id: int | None
     revisions: list[RevisionOut] = []
+
+
+# ============================ 分成合同与追溯试算 ============================
+
+class RevenueTierIn(BaseModel):
+    upper_revenue: Decimal | None = None   # 最后一段为 null 表示开放
+    rate: Decimal
+
+
+class DeductionIn(BaseModel):
+    name: str | None = None
+    monthly_amount: Decimal = Decimal("0")
+    start_date: date
+    end_date: date | None = None
+
+
+class PromoPeriodIn(BaseModel):
+    start_date: date
+    end_date: date
+
+
+class ContractRulesIn(BaseModel):
+    """条款的结构化表达：只接受固定字段，任何自由代码都会被服务端校验拒绝。"""
+    fixed_fee: Decimal = Decimal("0")
+    minimum_fee: Decimal = Decimal("0")
+    revenue_tiers: list[RevenueTierIn]
+    deductions: list[DeductionIn] = []
+    promo_periods: list[PromoPeriodIn] = []
+    priority: str | None = None   # minimum_first / promo_first / 留空(待澄清)
+
+    @model_validator(mode="after")
+    def _check_shape(self):
+        if not self.revenue_tiers:
+            raise ValueError("revenue_tiers 至少需要一个分段")
+        if self.priority not in (None, "minimum_first", "promo_first"):
+            raise ValueError("priority 只能是 minimum_first / promo_first / 留空")
+        return self
+
+
+class ContractCreateIn(BaseModel):
+    site_id: int
+    contract_no: str
+    name: str
+    # 实际生效范围（不是签署时间）
+    effective_date: date
+    end_date: date | None = None
+    signed_at: datetime | None = None
+    rules: ContractRulesIn
+    # 基于哪个已生效合同发起变更（可空=站点首份合同）
+    base_contract_id: int | None = None
+
+
+class ContractUpdateIn(BaseModel):
+    """草稿可反复编辑；一旦生效即不可再改。"""
+    name: str | None = None
+    effective_date: date | None = None
+    end_date: date | None = None
+    signed_at: datetime | None = None
+    rules: ContractRulesIn | None = None
+
+
+class ContractOut(ORMModel):
+    id: int
+    site_id: int
+    contract_no: str
+    version_no: int
+    name: str
+    status: str
+    rules_json: str
+    rules_hash: str
+    effective_date: date | None
+    end_date: date | None
+    signed_at: datetime | None
+    superseded_by_id: int | None
+    created_by: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class TrialCreateIn(BaseModel):
+    baseline_contract_id: int
+    candidate_contract_id: int
+    period_start: date
+    period_end: date
+
+
+class ApprovalIn(BaseModel):
+    period_start: date
+    period_end: date
+    note: str | None = None
+    # 覆盖相同账期时必填：声明本方案替代哪一份已批准试算
+    supersedes_trial_id: int | None = None
+
+
+class RejectIn(BaseModel):
+    note: str
+
+
+class TrialLineOut(ORMModel):
+    id: int
+    bill_id: int | None
+    period_month: str
+    line_status: str
+    clarify_reason: str | None
+    base_revenue: Decimal
+    cand_revenue: Decimal
+    base_deduction: Decimal
+    cand_deduction: Decimal
+    base_minimum: Decimal
+    cand_minimum: Decimal
+    base_minimum_applied: bool
+    cand_minimum_applied: bool
+    base_fixed_fee: Decimal
+    cand_fixed_fee: Decimal
+    base_in_promo: bool
+    cand_in_promo: bool
+    base_payable: Decimal
+    cand_payable: Decimal
+    delta: Decimal
+    base_rounding_diff: Decimal
+    cand_rounding_diff: Decimal
+    detail_json: str
+
+
+class TrialOut(ORMModel):
+    id: int
+    site_id: int
+    trial_no: str
+    baseline_contract_id: int
+    candidate_contract_id: int
+    period_start: date
+    period_end: date
+    status: str
+    status_reason: str | None
+    candidate_rules_hash: str
+    created_by: str
+    created_at: datetime
+    lines: list[TrialLineOut] = []
+
+
+class ApprovalOut(ORMModel):
+    id: int
+    trial_id: int
+    site_id: int
+    decision: str
+    period_start: date
+    period_end: date
+    approved_delta: Decimal
+    note: str | None
+    supersedes_trial_id: int | None
+    approved_by: str
+    created_at: datetime

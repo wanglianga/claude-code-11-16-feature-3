@@ -121,3 +121,125 @@ export interface Adjustment {
   created_by: string;
   created_at: string;
 }
+
+// ---------------- 分成合同与追溯试算 ----------------
+
+export interface RevenueTier {
+  upper_revenue: string | null;
+  rate: string;
+}
+
+export interface Deduction {
+  name?: string | null;
+  monthly_amount: string;
+  start_date: string;
+  end_date?: string | null;
+}
+
+export interface PromoPeriod {
+  start_date: string;
+  end_date: string;
+}
+
+export interface ContractRules {
+  fixed_fee: string;
+  minimum_fee: string;
+  revenue_tiers: RevenueTier[];
+  deductions: Deduction[];
+  promo_periods: PromoPeriod[];
+  priority: string | null;
+}
+
+export interface RevenueContract {
+  id: number;
+  site_id: number;
+  contract_no: string;
+  version_no: number;
+  name: string;
+  status: string;
+  rules_json: string;
+  rules_hash: string;
+  effective_date: string | null;
+  end_date: string | null;
+  signed_at: string | null;
+  superseded_by_id: number | null;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TrialLine {
+  id: number;
+  bill_id: number | null;
+  period_month: string;
+  line_status: string;
+  clarify_reason: string | null;
+  base_revenue: string;
+  cand_revenue: string;
+  base_deduction: string;
+  cand_deduction: string;
+  base_minimum: string;
+  cand_minimum: string;
+  base_minimum_applied: boolean;
+  cand_minimum_applied: boolean;
+  base_fixed_fee: string;
+  cand_fixed_fee: string;
+  base_in_promo: boolean;
+  cand_in_promo: boolean;
+  base_payable: string;
+  cand_payable: string;
+  delta: string;
+  base_rounding_diff: string;
+  cand_rounding_diff: string;
+  detail_json: string;
+}
+
+export interface ContractTrial {
+  id: number;
+  site_id: number;
+  trial_no: string;
+  baseline_contract_id: number;
+  candidate_contract_id: number;
+  period_start: string;
+  period_end: string;
+  status: string;
+  status_reason: string | null;
+  candidate_rules_hash: string;
+  created_by: string;
+  created_at: string;
+  lines: TrialLine[];
+}
+
+export interface ContractApproval {
+  id: number;
+  trial_id: number;
+  site_id: number;
+  decision: string;
+  period_start: string;
+  period_end: string;
+  approved_delta: string;
+  note: string | null;
+  supersedes_trial_id: number | null;
+  approved_by: string;
+  created_at: string;
+}
+
+export interface BillContractView {
+  bill_id: number;
+  bill_no: string;
+  original_contract_payable: string | null;
+  new_terms_payable: string | null;
+  approved_adjustment: string;
+  effective_payable: string | null;
+  latest_trial_id: number | null;
+  latest_trial_status: string | null;
+  approved_records: Array<{ trial_no: string; approval_id: number; delta: string; period: string }>;
+}
+
+export interface PayableStats {
+  site_id: number;
+  bill_count_with_contract: number;
+  original_contract_payable: string;
+  approved_adjustment: string;
+  effective_payable: string;
+}

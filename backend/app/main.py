@@ -6,6 +6,7 @@ from .routers import (
     auth,
     bills,
     conflicts,
+    contracts,
     entities,
     imports,
     jobs,
@@ -42,5 +43,6 @@ def health():
 for r in (
     auth.router, sites.router, imports.router, jobs.router, bills.router,
     tasks.router, conflicts.router, source_records.router, entities.router,
+    contracts.router,
 ):
     app.include_router(r)
